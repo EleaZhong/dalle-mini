@@ -1793,7 +1793,7 @@ class DalleBart(PretrainedFromWandbMixin, FlaxBartForConditionalGeneration):
 
     ):
         # mask_indices[0] = 0
-        mask_indices = mask_indices.at[0].set(0)
+        # mask_indices = mask_indices.at[0].set(0)
         # init values
         max_length = max_length if max_length is not None else self.config.max_length
         pad_token_id = (
