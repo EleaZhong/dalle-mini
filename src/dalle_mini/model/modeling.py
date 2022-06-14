@@ -1858,87 +1858,40 @@ class DalleBart(PretrainedFromWandbMixin, FlaxBartForConditionalGeneration):
             print(state.cur_len)
 
             prng_key, prng_key_next = jax.random.split(state.prng_key)
+            model_outputs = model(
+                state.running_token, params=params, **state.model_kwargs
+            )
 
-            def modelfunc(state):
-                model_outputs = model(
-                    state.running_token, params=params, **state.model_kwargs
+            logits = model_outputs.logits[:, -1]
+
+            # perform super conditioning
+            # Source: @RiversHaveWings - https://twitter.com/RiversHaveWings/status/1478093658716966912?s=20&t=xdm-wZ61Wf7OLnE_NJHZ1w
+            if condition_scale != 1.0:
+                model_outputs_uncond = model(
+                    state.running_token, params=params, **state.model_kwargs_uncond
                 )
+                logits_uncond = model_outputs_uncond.logits[:, -1]
+                logits = logits_uncond + condition_scale * (logits - logits_uncond)
+            else:
+                model_outputs_uncond = None
 
-                logits = model_outputs.logits[:, -1]
+            # apply min_length, ...
+            logits = logits_processor(state.sequences, logits, state.cur_len)
+            # apply top_k, top_k, temperature
+            logits = logits_warper(logits, logits, state.cur_len)
 
-                # perform super conditioning
-                # Source: @RiversHaveWings - https://twitter.com/RiversHaveWings/status/1478093658716966912?s=20&t=xdm-wZ61Wf7OLnE_NJHZ1w
-                if condition_scale != 1.0:
-                    model_outputs_uncond = model(
-                        state.running_token, params=params, **state.model_kwargs_uncond
-                    )
-                    logits_uncond = model_outputs_uncond.logits[:, -1]
-                    logits = logits_uncond + condition_scale * (logits - logits_uncond)
-                else:
-                    model_outputs_uncond = None
 
-                # apply min_length, ...
-                logits = logits_processor(state.sequences, logits, state.cur_len)
-                # apply top_k, top_k, temperature
-                logits = logits_warper(logits, logits, state.cur_len)
-
-                next_token = jax.random.categorical(prng_key, logits, axis=-1)
-
-                # print(next_token)
-                # print()
-                print("x")
-                next_model_kwargs = state.model_kwargs
-                next_model_kwargs["past_key_values"] = model_outputs.past_key_values
-                next_model_kwargs["decoder_position_ids"] = next_model_kwargs["decoder_position_ids"][:, -1:] + 1
-                
-                if condition_scale != 1.0:
-                    next_model_kwargs_uncond = state.model_kwargs_uncond
-                    next_model_kwargs_uncond["past_key_values"] = model_outputs_uncond.past_key_values
-                    next_model_kwargs_uncond["decoder_position_ids"] = next_model_kwargs_uncond["decoder_position_ids"][:, -1:] + 1
-                else:
-                    next_model_kwargs_uncond = None
-
-                return next_token, next_model_kwargs, next_model_kwargs_uncond
+            next_token = jax.random.categorical(prng_key, logits, axis=-1)
             
-            def passfunc(state):
-                # model_outputs = model(
-                #     state.running_token, params=params, **state.model_kwargs
-                # )
-
-                # model_outputs = state.model_kwargs["past_key_values"]
-                # model_outputs['model']['decoder']['layers']['FlaxBartDecoderLayers']['FlaxBartAttention_0']['cache_index'] += 1
-
-                # model_outputs_uncond = model(
-                #     state.running_token, params=params, **state.model_kwargs_uncond
-                # )
-                # model_outputs_uncond = state.model_kwargs_uncond["past_key_values"]
-                # model_outputs_uncond['model']['decoder']['layers']['FlaxBartDecoderLayers']['FlaxBartAttention_0']['cache_index'] += 1
-                # model_outputs = None
-                # model_outputs_uncond = None
+            def modelfunc(next_token):
+                return next_token
+            
+            def passfunc(_):
                 print("y")
-
-                # if gen_indices:
                 next_token = gen_indices[:,state.cur_len-1]
-                # else:
-                    # next_token = jnp.array([generation_rep_num])
+                return next_token
 
-                next_model_kwargs = state.model_kwargs
-                # next_model_kwargs["past_key_values"]['model']['decoder']['layers']['FlaxBartDecoderLayers']['FlaxBartAttention_0']['cache_index'] += 1
-                next_model_kwargs["decoder_position_ids"] = next_model_kwargs["decoder_position_ids"][:, -1:] + 1
-                
-                if condition_scale != 1.0:
-                    next_model_kwargs_uncond = state.model_kwargs_uncond
-                    # next_model_kwargs_uncond["past_key_values"]['model']['decoder']['layers']['FlaxBartDecoderLayers']['FlaxBartAttention_0']['cache_index'] += 1
-                    next_model_kwargs_uncond["decoder_position_ids"] = next_model_kwargs_uncond["decoder_position_ids"][:, -1:] + 1
-                else:
-                    next_model_kwargs_uncond = None
-                
-                return next_token, next_model_kwargs, next_model_kwargs_uncond
-
-            # print(state.cur_len<32)
-            
-            # next_token,next_model_kwargs, next_model_kwargs_uncond = jax.lax.cond(state.cur_len<generation_rep_length, passfunc, modelfunc, state)
-            next_token,next_model_kwargs, next_model_kwargs_uncond = jax.lax.cond(mask_indices[state.cur_len-1] == 1, passfunc, modelfunc, state)
+            next_token = jax.lax.cond(mask_indices[state.cur_len-1] == 1, passfunc, modelfunc, next_token)
             
 
             next_is_sent_finished = state.is_sent_finished | (
@@ -1952,6 +1905,16 @@ class DalleBart(PretrainedFromWandbMixin, FlaxBartForConditionalGeneration):
 
             next_sequences = lax.dynamic_update_slice(
                 state.sequences, next_token, (0, state.cur_len)
+            )
+            next_model_kwargs = self.update_inputs_for_generation(
+                model_outputs, state.model_kwargs
+            )
+            next_model_kwargs_uncond = (
+                self.update_inputs_for_generation(
+                    model_outputs_uncond, state.model_kwargs_uncond
+                )
+                if condition_scale != 1.0
+                else None
             )
 
             return SampleState(
